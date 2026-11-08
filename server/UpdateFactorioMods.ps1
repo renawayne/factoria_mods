@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 
 $Repository = "renawayne/factoria_mods"
 $Branch = "main"
@@ -18,17 +18,25 @@ function Write-Info($Message) {
 function Get-ZipModName($ZipPath) {
     $archive = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
     try {
-        $entry = $archive.Entries | Where-Object { $_.FullName -eq "info.json" } | Select-Object -First 1
-        if (-not $entry) { throw "В архиве нет info.json в корне: $([IO.Path]::GetFileName($ZipPath))" }
-        $reader = [System.IO.StreamReader]::new($entry.Open())
+        $entries = @($archive.Entries | Where-Object {
+            $_.FullName -match '(^|[\\/])info\.json$'
+        })
+
+        if ($entries.Count -ne 1) {
+            throw "В архиве должен быть ровно один info.json: $([IO.Path]::GetFileName($ZipPath))"
+        }
+
+        $reader = [System.IO.StreamReader]::new($entries[0].Open())
         try {
             $info = $reader.ReadToEnd() | ConvertFrom-Json
         } finally {
             $reader.Dispose()
         }
+
         if (-not $info.name -or $info.name -notmatch '^[A-Za-z0-9_-]+$') {
             throw "Некорректное поле name в info.json: $([IO.Path]::GetFileName($ZipPath))"
         }
+
         return [string]$info.name
     } finally {
         $archive.Dispose()
@@ -40,17 +48,19 @@ try {
 
     New-Item -ItemType Directory -Force -Path $ModsDir, $StateDir, $TempDir | Out-Null
 
-    Write-Info "Получаю список модов из GitHub..."
-    $headers = @{ "User-Agent" = "Factorio-Death-train-Mod-Sync"; "Accept" = "application/vnd.github+json" }
-    $items = Invoke-RestMethod -Uri $ApiUrl -Headers $headers
-
-    if ($items -isnot [System.Array]) {
-        throw "GitHub API не вернул список файлов. Проверь путь $PackPath."
+    Write-Info "Получаю список файлов из GitHub..."
+    $headers = @{
+        "User-Agent" = "Factorio-Death-train-Mod-Sync"
+        "Accept" = "application/vnd.github+json"
     }
+    $items = @(Invoke-RestMethod -Uri $ApiUrl -Headers $headers)
 
-    $zipItems = @($items | Where-Object { $_.type -eq "file" -and $_.name -match '\.zip$' })
+    $zipItems = @($items | Where-Object {
+        $_.type -eq "file" -and $_.name -match '(?i)\.zip$'
+    })
+
     if ($zipItems.Count -eq 0) {
-        Write-Info "В GitHub пока нет ZIP-модов. Локальные файлы не изменены."
+        Write-Info "В GitHub нет ZIP-модов. Локальные файлы не изменены."
         exit 0
     }
 
@@ -58,14 +68,49 @@ try {
     if (Test-Path $StateFile) {
         foreach ($line in Get-Content $StateFile) {
             $parts = $line -split "`t", 2
-            if ($parts.Count -eq 2) {
-                $oldEntries += [pscustomobject]@{ File = $parts[0]; Name = $parts[1] }
+            if ($parts.Count -eq 2 -and
+                $parts[0] -match '^[A-Za-z0-9._-]+\.zip$' -and
+                $parts[1] -match '^[A-Za-z0-9_-]+$') {
+                $oldEntries += [pscustomobject]@{
+                    File = $parts[0]
+                    Name = $parts[1]
+                }
             }
         }
     }
 
+    # mod-list.json in GitHub is the source of truth for this pack.
+    $remoteModList = $items | Where-Object {
+        $_.type -eq "file" -and $_.name -eq "mod-list.json"
+    } | Select-Object -First 1
+
+    $modListPath = Join-Path $ModsDir "mod-list.json"
+    $stagedModList = Join-Path $TempDir "mod-list.json"
+
+    if ($remoteModList -and $remoteModList.download_url) {
+        Invoke-WebRequest -Uri $remoteModList.download_url -OutFile $stagedModList
+    } elseif (Test-Path $modListPath) {
+        Copy-Item -LiteralPath $modListPath -Destination $stagedModList
+        Write-Info "В GitHub нет mod-list.json; оставляю локальный список."
+    } else {
+        '{"mods":[{"name":"base","enabled":true}]}' |
+            Set-Content -LiteralPath $stagedModList -Encoding utf8
+    }
+
+    $modList = Get-Content -Raw -LiteralPath $stagedModList | ConvertFrom-Json
+    if (-not $modList.mods -or -not (@($modList.mods) | Where-Object { $_.name -eq "base" })) {
+        throw "mod-list.json некорректен или в нём отсутствует мод base."
+    }
+
     $newEntries = @()
     foreach ($item in $zipItems) {
+        if ($item.name -notmatch '^[A-Za-z0-9._-]+\.zip$') {
+            throw "Недопустимое имя ZIP-файла: $($item.name)"
+        }
+        if (-not $item.download_url) {
+            throw "GitHub не предоставил ссылку для $($item.name)"
+        }
+
         $destination = Join-Path $TempDir $item.name
         Write-Info "Скачиваю $($item.name)"
         Invoke-WebRequest -Uri $item.download_url -OutFile $destination
@@ -75,76 +120,123 @@ try {
             throw "Несколько ZIP-файлов содержат один и тот же мод: $modName"
         }
 
-        $newEntries += [pscustomobject]@{ File = $item.name; Name = $modName; Temp = $destination }
+        $newEntries += [pscustomobject]@{
+            File = $item.name
+            Name = $modName
+            Temp = $destination
+        }
     }
 
+    # Keep enabled/disabled values authored in GitHub. Add missing custom mods.
+    $mods = @($modList.mods)
+    foreach ($entry in $newEntries) {
+        if (@($mods | Where-Object { $_.name -eq $entry.Name }).Count -eq 0) {
+            $mods += [pscustomobject]@{
+                name = $entry.Name
+                enabled = $true
+            }
+        }
+    }
+    $modList.mods = @($mods)
+
+    $json = $modList | ConvertTo-Json -Depth 100
+    [System.IO.File]::WriteAllText(
+        $stagedModList,
+        $json,
+        [System.Text.UTF8Encoding]::new($false)
+    )
+
+    # Never overwrite an unmanaged file with different contents.
     foreach ($entry in $newEntries) {
         $target = Join-Path $ModsDir $entry.File
-        $wasManaged = $oldEntries.File -contains $entry.File
+        $wasManaged = @($oldEntries | Where-Object { $_.File -eq $entry.File }).Count -gt 0
+
         if ((Test-Path $target) -and -not $wasManaged) {
-            $localHash = (Get-FileHash $target -Algorithm SHA256).Hash
-            $newHash = (Get-FileHash $entry.Temp -Algorithm SHA256).Hash
+            $localHash = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
+            $newHash = (Get-FileHash -LiteralPath $entry.Temp -Algorithm SHA256).Hash
             if ($localHash -ne $newHash) {
                 throw "Файл $($entry.File) уже существует и не принадлежит синхронизатору. Конфликт не перезаписан."
             }
         }
     }
 
-    # All downloads and ZIP checks completed before touching the active mod directory.
+    $backupRoot = Join-Path $StateDir "backups"
+    $backupDir = Join-Path $backupRoot (Get-Date -Format "yyyyMMdd-HHmmss")
+    New-Item -ItemType Directory -Force -Path $backupRoot | Out-Null
+
+    $hasChanges = $false
     foreach ($entry in $newEntries) {
         $target = Join-Path $ModsDir $entry.File
-        $staged = "$target.new"
-        Copy-Item -LiteralPath $entry.Temp -Destination $staged -Force
-        Move-Item -LiteralPath $staged -Destination $target -Force
+        if (-not (Test-Path $target) -or
+            (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -ne
+            (Get-FileHash -LiteralPath $entry.Temp -Algorithm SHA256).Hash) {
+            $hasChanges = $true
+        }
+    }
+    foreach ($old in $oldEntries) {
+        if ($newEntries.File -notcontains $old.File) { $hasChanges = $true }
+    }
+    if (-not (Test-Path $modListPath) -or
+        (Get-FileHash -LiteralPath $stagedModList -Algorithm SHA256).Hash -ne
+        (Get-FileHash -LiteralPath $modListPath -Algorithm SHA256).Hash) {
+        $hasChanges = $true
     }
 
-    foreach ($old in $oldEntries) {
-        if ($newEntries.File -notcontains $old.File) {
+    if ($hasChanges) {
+        New-Item -ItemType Directory -Force -Path (Join-Path $backupDir "mods") | Out-Null
+
+        if (Test-Path $modListPath) {
+            Copy-Item -LiteralPath $modListPath -Destination $backupDir
+        }
+        foreach ($old in $oldEntries) {
             $oldPath = Join-Path $ModsDir $old.File
-            if (Test-Path $oldPath) { Remove-Item -LiteralPath $oldPath -Force }
-        }
-    }
-
-    $modListPath = Join-Path $ModsDir "mod-list.json"
-    if (Test-Path $modListPath) {
-        $modList = Get-Content -Raw $modListPath | ConvertFrom-Json
-    } else {
-        $modList = [pscustomobject]@{ mods = @([pscustomobject]@{ name = "base"; enabled = $true }) }
-    }
-
-    if (-not $modList.mods) { $modList | Add-Member -NotePropertyName mods -NotePropertyValue @() -Force }
-    $mods = @($modList.mods)
-
-    foreach ($old in $oldEntries) {
-        if ($newEntries.Name -notcontains $old.Name) {
-            $mods = @($mods | Where-Object { $_.name -ne $old.Name })
-        }
-    }
-
-    foreach ($entry in $newEntries) {
-        $found = $false
-        foreach ($mod in $mods) {
-            if ($mod.name -eq $entry.Name) {
-                $mod.enabled = $true
-                $found = $true
+            if (Test-Path $oldPath) {
+                Copy-Item -LiteralPath $oldPath -Destination (Join-Path $backupDir "mods")
             }
         }
-        if (-not $found) {
-            $mods += [pscustomobject]@{ name = $entry.Name; enabled = $true }
+
+        foreach ($entry in $newEntries) {
+            $target = Join-Path $ModsDir $entry.File
+            $staged = "$target.new"
+            Copy-Item -LiteralPath $entry.Temp -Destination $staged -Force
+            Move-Item -LiteralPath $staged -Destination $target -Force
         }
+
+        foreach ($old in $oldEntries) {
+            if ($newEntries.File -notcontains $old.File) {
+                $oldPath = Join-Path $ModsDir $old.File
+                if (Test-Path $oldPath) {
+                    Remove-Item -LiteralPath $oldPath -Force
+                }
+            }
+        }
+
+        $jsonTemp = "$modListPath.new"
+        Copy-Item -LiteralPath $stagedModList -Destination $jsonTemp -Force
+        Move-Item -LiteralPath $jsonTemp -Destination $modListPath -Force
+
+        Write-Info "Изменения применены. Резервная копия: $backupDir"
+
+        $oldBackups = @(Get-ChildItem -LiteralPath $backupRoot -Directory |
+            Sort-Object Name -Descending)
+        if ($oldBackups.Count -gt 3) {
+            $oldBackups | Select-Object -Skip 3 | Remove-Item -Recurse -Force
+        }
+    } else {
+        Write-Info "Изменений нет."
     }
 
-    $modList.mods = @($mods)
-    $json = $modList | ConvertTo-Json -Depth 20
-    $jsonTemp = "$modListPath.new"
-    [System.IO.File]::WriteAllText($jsonTemp, $json, [System.Text.UTF8Encoding]::new($false))
-    Move-Item -LiteralPath $jsonTemp -Destination $modListPath -Force
+    $stateLines = @($newEntries | ForEach-Object {
+        "$($_.File)`t$($_.Name)"
+    })
+    [System.IO.File]::WriteAllLines(
+        $StateFile,
+        $stateLines,
+        [System.Text.UTF8Encoding]::new($false)
+    )
 
-    $stateLines = @($newEntries | ForEach-Object { "$($_.File)`t$($_.Name)" })
-    [System.IO.File]::WriteAllLines($StateFile, $stateLines, [System.Text.UTF8Encoding]::new($false))
-
-    Write-Info "Синхронизация завершена. Управляемых модов: $($newEntries.Count)."
-    Write-Info "Остальные моды и настройки не изменялись."
+    Write-Info "Синхронизация завершена. ZIP-модов: $($newEntries.Count)."
+    Write-Info "mod-list.json синхронизирован с GitHub."
     exit 0
 }
 catch {

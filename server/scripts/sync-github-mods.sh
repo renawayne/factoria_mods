@@ -7,6 +7,7 @@ PACK_PATH="${GITHUB_PACK_PATH:-Death_train/mods}"
 MODS_DIR="${MODS:-/factorio/mods}"
 STATE_DIR="/factorio/.github-mod-sync"
 STATE_FILE="${STATE_DIR}/managed.tsv"
+IGNORE_FILE="${STATE_DIR}/update-ignore"
 API_URL="https://api.github.com/repos/${REPOSITORY}/contents/${PACK_PATH}?ref=${BRANCH}"
 
 log() { echo "[GitHub Mod Sync] $*"; }
@@ -23,6 +24,32 @@ command -v curl >/dev/null || fail "curl is not installed"
 command -v jq >/dev/null || fail "jq is not installed"
 command -v unzip >/dev/null || fail "unzip is not installed"
 
+# Load the previously managed mods before contacting GitHub.
+declare -A OLD_FILES=()
+declare -A OLD_NAMES=()
+
+if [ -f "$STATE_FILE" ]; then
+  while IFS=$'\t' read -r filename modname; do
+    [[ "${filename:-}" =~ ^[A-Za-z0-9._-]+\.zip$ ]] || continue
+    [[ "${modname:-}" =~ ^[A-Za-z0-9_-]+$ ]] || continue
+    OLD_FILES["$filename"]=1
+    OLD_NAMES["$modname"]=1
+  done < "$STATE_FILE"
+fi
+
+# The child sync process cannot export variables back to its parent entrypoint.
+# Persist managed mod names so factorio-entrypoint.sh can pass them to Factorio.
+write_ignore_file() {
+  : > "$IGNORE_FILE"
+  local name
+  for name in "$@"; do
+    [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || continue
+    printf '%s\n' "$name" >> "$IGNORE_FILE"
+  done
+}
+
+write_ignore_file "${!OLD_NAMES[@]}"
+
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
@@ -38,32 +65,43 @@ curl --fail --silent --show-error --location \
 jq -e 'type == "array"' "$WORK_DIR/list.json" >/dev/null \
   || skip_update "GitHub path is not a directory or API returned an error."
 
-mapfile -t ENTRIES < <(
-  jq -r '.[] | select(.type == "file" and (.name | ascii_downcase | endswith(".zip"))) | [.name, .download_url] | @tsv' "$WORK_DIR/list.json"
+mapfile -t ZIP_NAMES < <(
+  jq -r '.[] | select(.type == "file" and (.name | ascii_downcase | endswith(".zip"))) | .name' "$WORK_DIR/list.json"
 )
 
-if [ "${#ENTRIES[@]}" -eq 0 ]; then
-  log "No ZIP files found. Existing managed mods are left untouched."
-  exit 0
+if [ "${#ZIP_NAMES[@]}" -eq 0 ]; then
+  skip_update "No ZIP files found in the GitHub mod folder."
 fi
 
 declare -A NEW_FILES=()
 declare -A NEW_NAMES=()
-declare -A OLD_FILES=()
-declare -A OLD_NAMES=()
 
-if [ -f "$STATE_FILE" ]; then
-  while IFS=$'\t' read -r filename modname; do
-    [ -n "${filename:-}" ] && OLD_FILES["$filename"]=1
-    [ -n "${modname:-}" ] && OLD_NAMES["$modname"]=1
-  done < "$STATE_FILE"
+# GitHub mod-list.json is the source of truth for this pack.
+mod_list_url="$(jq -r '.[] | select(.type == "file" and .name == "mod-list.json") | .download_url' "$WORK_DIR/list.json" | head -n1)"
+if [ -n "$mod_list_url" ] && [ "$mod_list_url" != "null" ]; then
+  curl --fail --silent --show-error --location \
+    --retry 3 --retry-delay 2 \
+    "$mod_list_url" -o "$WORK_DIR/mod-list.json" \
+    || skip_update "Could not download mod-list.json from GitHub."
+elif [ -f "$MODS_DIR/mod-list.json" ]; then
+  cp "$MODS_DIR/mod-list.json" "$WORK_DIR/mod-list.json"
+  log "GitHub has no mod-list.json; keeping the existing server mod-list."
+else
+  printf '%s\n' '{"mods":[{"name":"base","enabled":true}]}' > "$WORK_DIR/mod-list.json"
+  log "No mod-list.json found; creating a minimal list."
 fi
 
-for entry in "${ENTRIES[@]}"; do
-  IFS=$'\t' read -r filename download_url <<< "$entry"
-  [[ -n "${filename:-}" && -n "${download_url:-}" ]] || skip_update "Invalid GitHub directory entry."
-  [[ "$filename" != */* ]] || skip_update "Unexpected filename: $filename"
-  [[ "$filename" =~ \.zip$ ]] || continue
+jq -e '(.mods | type == "array") and any(.mods[]?; .name == "base")' \
+  "$WORK_DIR/mod-list.json" >/dev/null \
+  || skip_update "mod-list.json is invalid or does not contain the base mod."
+
+for filename in "${ZIP_NAMES[@]}"; do
+  [[ "$filename" =~ ^[A-Za-z0-9._-]+\.zip$ ]] \
+    || skip_update "Unexpected ZIP filename: $filename"
+
+  download_url="$(jq -r --arg name "$filename" '.[] | select(.type == "file" and .name == $name) | .download_url' "$WORK_DIR/list.json" | head -n1)"
+  [[ -n "$download_url" && "$download_url" != "null" ]] \
+    || skip_update "No download URL for $filename."
 
   target="$WORK_DIR/$filename"
   log "Downloading $filename"
@@ -75,21 +113,53 @@ for entry in "${ENTRIES[@]}"; do
   unzip -tqq "$target" >/dev/null \
     || skip_update "$filename is not a valid ZIP archive."
 
-  modname="$(unzip -p "$target" info.json 2>/dev/null | jq -er '.name' 2>/dev/null)" \
-    || skip_update "$filename does not contain a valid root-level info.json with a name."
+  mapfile -t info_entries < <(
+    unzip -Z1 "$target" | awk '
+      {
+        original = $0
+        normalized = tolower($0)
+        sub(/^\.\//, "", normalized)
+        if (normalized == "info.json" || normalized ~ /\/info\.json$/) print original
+      }
+    '
+  )
 
-  [[ "$modname" =~ ^[A-Za-z0-9_-]+$ ]] || skip_update "Invalid Factorio mod name in $filename: $modname"
-  [ -z "${NEW_NAMES[$modname]+x}" ] || skip_update "More than one ZIP declares mod name '$modname'."
+  [ "${#info_entries[@]}" -eq 1 ] \
+    || skip_update "$filename must contain exactly one info.json."
+
+  modname="$(unzip -p "$target" "${info_entries[0]}" 2>/dev/null | jq -er '.name' 2>/dev/null)" \
+    || skip_update "$filename contains an invalid info.json or no mod name."
+
+  [[ "$modname" =~ ^[A-Za-z0-9_-]+$ ]] \
+    || skip_update "Invalid Factorio mod name in $filename: $modname"
+
+  [ -z "${NEW_NAMES[$modname]+x}" ] \
+    || skip_update "More than one ZIP declares mod name '$modname'."
+
   NEW_FILES["$filename"]="$modname"
   NEW_NAMES["$modname"]=1
 done
 
-# Do not overwrite a ZIP that this synchronizer does not own.
+# Add missing GitHub-managed mods to mod-list.json.
+# Existing enabled/disabled values are kept as authored in GitHub.
+for modname in "${!NEW_NAMES[@]}"; do
+  jq --arg name "$modname" '
+    if any(.mods[]?; .name == $name) then
+      .
+    else
+      .mods += [{"name":$name,"enabled":true}]
+    end
+  ' "$WORK_DIR/mod-list.json" > "$WORK_DIR/mod-list.next.json" \
+    || skip_update "Could not update mod-list.json."
+  mv "$WORK_DIR/mod-list.next.json" "$WORK_DIR/mod-list.json"
+done
+
+# Never overwrite an existing ZIP unless this synchronizer owns it.
 for filename in "${!NEW_FILES[@]}"; do
   target="$MODS_DIR/$filename"
   if [ -e "$target" ] && [ -z "${OLD_FILES[$filename]+x}" ]; then
     if ! cmp -s "$WORK_DIR/$filename" "$target"; then
-      skip_update "$filename already exists but is not managed by GitHub sync. Rename or move the conflicting file first."
+      skip_update "$filename already exists but is not managed by GitHub sync. Move or rename the conflicting file first."
     fi
   fi
 done
@@ -104,10 +174,11 @@ done
 for filename in "${!OLD_FILES[@]}"; do
   [ -n "${NEW_FILES[$filename]+x}" ] || changed=1
 done
+if [ ! -f "$MODS_DIR/mod-list.json" ] || ! cmp -s "$WORK_DIR/mod-list.json" "$MODS_DIR/mod-list.json"; then
+  changed=1
+fi
 
-if [ "$changed" -eq 0 ]; then
-  log "No changes detected."
-else
+if [ "$changed" -eq 1 ]; then
   timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
   backup_dir="/factorio/backups/github-mod-sync/$timestamp"
   mkdir -p "$backup_dir/mods" "$backup_dir/saves"
@@ -123,74 +194,39 @@ else
     cp -a "$latest_save" "$backup_dir/saves/"
   fi
 
-  # Downloaded archives are already staged and validated; apply them now.
+  # Apply only after every download and validation has succeeded.
   for filename in "${!NEW_FILES[@]}"; do
     install -m 0644 "$WORK_DIR/$filename" "$MODS_DIR/$filename.tmp"
     mv -f "$MODS_DIR/$filename.tmp" "$MODS_DIR/$filename"
   done
 
-  # Remove only files previously recorded as managed by this synchronizer.
   for filename in "${!OLD_FILES[@]}"; do
     [ -n "${NEW_FILES[$filename]+x}" ] || rm -f -- "$MODS_DIR/$filename"
   done
 
-  # Preserve the existing mod list and update only GitHub-managed mod entries.
-  if [ ! -f "$MODS_DIR/mod-list.json" ]; then
-    printf '%s\n' '{"mods":[{"name":"base","enabled":true}]}' > "$MODS_DIR/mod-list.json"
-  fi
+  install -m 0644 "$WORK_DIR/mod-list.json" "$MODS_DIR/mod-list.json.tmp"
+  mv -f "$MODS_DIR/mod-list.json.tmp" "$MODS_DIR/mod-list.json"
 
-  for old_name in "${!OLD_NAMES[@]}"; do
-    [ -n "${NEW_NAMES[$old_name]+x}" ] || \
-      jq --arg name "$old_name" '.mods |= map(select(.name != $name))' \
-        "$MODS_DIR/mod-list.json" > "$WORK_DIR/mod-list.json" \
-      && mv "$WORK_DIR/mod-list.json" "$MODS_DIR/mod-list.json"
+  log "GitHub mod pack updated. Backup: $backup_dir"
+
+  mapfile -t backup_dirs < <(find /factorio/backups/github-mod-sync -mindepth 1 -maxdepth 1 -type d | sort -r)
+  for ((i=3; i<${#backup_dirs[@]}; i++)); do
+    rm -rf -- "${backup_dirs[$i]}"
   done
-
-  for modname in "${!NEW_NAMES[@]}"; do
-    jq --arg name "$modname" '
-      if any(.mods[]?; .name == $name) then
-        .mods |= map(if .name == $name then .enabled = true else . end)
-      else
-        .mods += [{"name":$name,"enabled":true}]
-      end
-    ' "$MODS_DIR/mod-list.json" > "$WORK_DIR/mod-list.json" \
-      && mv "$WORK_DIR/mod-list.json" "$MODS_DIR/mod-list.json"
-  done
-
-  : > "$WORK_DIR/managed.tsv"
-  for filename in "${!NEW_FILES[@]}"; do
-    printf '%s\t%s\n' "$filename" "${NEW_FILES[$filename]}" >> "$WORK_DIR/managed.tsv"
-  done
-  sort -o "$WORK_DIR/managed.tsv" "$WORK_DIR/managed.tsv"
-  install -m 0644 "$WORK_DIR/managed.tsv" "$STATE_FILE"
-
-  # Keep the three most recent sync backups.
-  if [ -d /factorio/backups/github-mod-sync ]; then
-    mapfile -t backup_dirs < <(find /factorio/backups/github-mod-sync -mindepth 1 -maxdepth 1 -type d | sort -r)
-    for ((i=3; i<${#backup_dirs[@]}; i++)); do
-      rm -rf -- "${backup_dirs[$i]}"
-    done
-  fi
-
-  log "GitHub-managed mods updated. Backup: $backup_dir"
+else
+  log "No changes detected."
 fi
 
-# Prevent the official Mod Portal updater from replacing GitHub-managed mods.
-managed_names=""
-for modname in "${!NEW_NAMES[@]}"; do
-  if [ -n "$managed_names" ]; then managed_names+=","
-  fi
-  managed_names+="$modname"
+# Record managed ZIPs and the names to protect from the official Mod Portal updater.
+: > "$WORK_DIR/managed.tsv"
+for filename in "${!NEW_FILES[@]}"; do
+  printf '%s\t%s\n' "$filename" "${NEW_FILES[$filename]}" >> "$WORK_DIR/managed.tsv"
 done
-if [ -n "$managed_names" ]; then
-  if [ -n "${UPDATE_IGNORE:-}" ]; then
-    export UPDATE_IGNORE="${UPDATE_IGNORE},${managed_names}"
-  else
-    export UPDATE_IGNORE="$managed_names"
-  fi
-fi
+sort -o "$WORK_DIR/managed.tsv" "$WORK_DIR/managed.tsv"
+install -m 0644 "$WORK_DIR/managed.tsv" "$STATE_FILE"
+write_ignore_file "${!NEW_NAMES[@]}"
 
-# The official image runs Factorio as UID/GID 845 by default.
 chown -R 845:845 "$MODS_DIR" "$STATE_DIR" /factorio/backups 2>/dev/null || true
 
 log "Synchronization complete."
+log "Protected GitHub-managed mods: $(paste -sd, "$IGNORE_FILE" 2>/dev/null || true)"
