@@ -208,6 +208,11 @@
       "enabled": true
     },
     
+	{
+	  "name": "reskins-assets-assorted",
+	  "enabled": true
+	},
+	
     {
       "name": "reskins-bobs",
       "enabled": true
