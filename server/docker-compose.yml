@@ -6,6 +6,9 @@ services:
     image: factorio-death-train:local
     container_name: factorio-death-train
     restart: unless-stopped
+    dns:
+        - 1.1.1.1
+        - 8.8.8.8
 
     ports:
       - "${SERVER_PORT:-34197}:${SERVER_PORT:-34197}/udp"
