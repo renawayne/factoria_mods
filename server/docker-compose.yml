@@ -1,0 +1,39 @@
+services:
+  factorio:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: factorio-death-train:local
+    container_name: factorio-death-train
+    restart: unless-stopped
+
+    ports:
+      - "${SERVER_PORT:-34197}:${SERVER_PORT:-34197}/udp"
+
+    volumes:
+      - /opt/factorio-death-train:/factorio
+
+    environment:
+      GITHUB_REPOSITORY: "renawayne/factoria_mods"
+      GITHUB_BRANCH: "main"
+      GITHUB_PACK_PATH: "Death_train/mods"
+
+      PORT: "${SERVER_PORT:-34197}"
+      DLC_SPACE_AGE: "true"
+      GENERATE_NEW_SAVE: "true"
+      LOAD_LATEST_SAVE: "true"
+      SAVE_NAME: "factory"
+
+      # Enable and provide Factorio.com credentials to download official Mod Portal mods.
+      UPDATE_MODS_ON_START: "${UPDATE_MODS_ON_START:-false}"
+      USERNAME: "${FACTORIO_USERNAME:-}"
+      TOKEN: "${FACTORIO_TOKEN:-}"
+
+      # Comma-separated Factorio player names, for example "PlayerOne,PlayerTwo".
+      ADMIN_LIST: "${ADMIN_LIST:-}"
+
+      # Optional comma-separated official mod names to ignore.
+      # GitHub-managed mod names are appended automatically by the sync script.
+      UPDATE_IGNORE: "${UPDATE_IGNORE:-}"
+
+    stop_grace_period: 2m

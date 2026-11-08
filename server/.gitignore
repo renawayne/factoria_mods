@@ -1,0 +1,6 @@
+# Local secrets
+.env
+
+# Local Factorio data
+data/
+*.zip
